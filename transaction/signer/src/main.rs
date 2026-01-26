@@ -4,17 +4,23 @@
 //!
 //! WIP port / simplification from https://github.com/mobilecoinofficial/full-service/blob/fefe6f645d676b393ece2f607f0081304141b590/transaction-signer/src/bin/main.rs#L337
 
-use std::path::Path;
-
+use anyhow::anyhow;
 use bip39::{Language, Mnemonic, MnemonicType};
 use clap::Parser;
-use log::{debug, info};
+use log::info;
+use mc_common::logger::{create_app_logger, o};
+use mc_crypto_keys::RistrettoPrivate;
 use serde::{Deserialize, Serialize};
 
-use mc_core::{account::Account, slip10::Slip10KeyGenerator};
+use mc_core::{
+    account::{self, Account},
+    keys::{RootSpendPrivate, RootViewPrivate},
+    slip10::Slip10KeyGenerator,
+};
 use mc_crypto_ring_signature_signer::LocalRingSigner;
 use mc_transaction_core::AccountKey;
 use mc_transaction_signer::{read_input, write_output, Operations};
+// use rand::{thread_rng, RngCore};
 
 #[derive(Clone, PartialEq, Debug, Parser)]
 struct Args {
@@ -30,6 +36,10 @@ struct Args {
 enum Actions {
     /// Create a new offline account, writing secrets to the output file
     Create {
+        /// Optional account name
+        #[clap(short, long)]
+        name: Option<String>,
+
         /// File name for account secrets to be written to
         #[clap(short, long)]
         output: String,
@@ -39,9 +49,6 @@ enum Actions {
         /// Optional account name
         #[clap(short, long)]
         name: Option<String>,
-
-        /// Mnemonic for account import
-        mnemonic: String,
 
         /// File for account secrets to be written to
         #[clap(short, long)]
@@ -58,33 +65,55 @@ struct AccountSecrets {
     mnemonic: String,
 }
 
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct AccountPrivateKeys {
+    spend_private_key: String,
+    view_private_key: String,
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct AccountImport {
+    name: Option<String>,
+    spend_public_key: String,
+    view_private_key: String,
+}
+
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+struct AccountImportFile {
+    params: AccountImport,
+}
+
 fn main() -> anyhow::Result<()> {
+    // Initialize logger
+    let _logger = create_app_logger(o!());
+
     // Parse command line arguments
     let args = Args::parse();
 
     // Run commands
     match &args.action {
-        Actions::Create { output } | Actions::Import { output, .. } => {
-            // Generate or parse mnemonic
-            let mnemonic = match &args.action {
-                Actions::Import { mnemonic, .. } => {
-                    Mnemonic::from_phrase(mnemonic, Language::English).unwrap()
+        Actions::Create { output, name } | Actions::Import { output, name, .. } => {
+            let account = match &args.action {
+                Actions::Import { .. } => {
+                    let private_keys: AccountPrivateKeys = read_input(&args.secret_file)?;
+                    account_from_private_keys(private_keys)
                 }
-                _ => Mnemonic::new(MnemonicType::Words24, Language::English),
-            };
+                _ => {
+                    let mnemonic = Mnemonic::new(MnemonicType::Words24, Language::English);
+                    let slip10key = mnemonic.derive_slip10_key(0);
 
-            // Generate secrets object
-            let s = AccountSecrets {
-                mnemonic: mnemonic.to_string(),
+                    // Generate account from secrets
+                    let account = Account::from(&slip10key);
+                    account
+                }
             };
-
-            // Check we're not overwriting an existing secret file
-            if Path::new(output).exists() {
-                return Err(anyhow::anyhow!(
-                    "creation would overwrite existing secrets file '{}'",
-                    output
-                ));
-            }
+            let s = AccountImportFile {
+                params: AccountImport {
+                    name: name.clone(),
+                    spend_public_key: hex::encode(account.spend_public_key().to_bytes()),
+                    view_private_key: hex::encode(account.view_private_key().as_ref()),
+                },
+            };
 
             // Otherwise write out new secrets
             write_output(output, &s)?;
@@ -93,17 +122,11 @@ fn main() -> anyhow::Result<()> {
         }
         Actions::Signer(c) => {
             // Load account secrets
-            let secrets: AccountSecrets = read_input(&args.secret_file)?;
-            let mnemonic = Mnemonic::from_phrase(&secrets.mnemonic, Language::English)?;
+            info!("Account secrets written to '{}'", c.account_index());
 
-            // Perform SLIP-0010 derivation
+            let private_keys: AccountPrivateKeys = read_input(&args.secret_file)?;
+            let a = account_from_private_keys(private_keys);
             let account_index = c.account_index();
-            let slip10key = mnemonic.derive_slip10_key(account_index);
-
-            // Generate account from secrets
-            let a = Account::from(&slip10key);
-
-            debug!("Using account: {:?}", a);
 
             // Handle standard commands
             match c {
@@ -123,10 +146,43 @@ fn main() -> anyhow::Result<()> {
                     // Perform transaction signing
                     Operations::sign_tx(&ring_signer, input, output)?;
                 }
+                Operations::SignUnsignedTx { input, output, .. } => {
+                    let account_key = AccountKey::new(
+                        a.spend_private_key().as_ref(),
+                        a.view_private_key().as_ref(),
+                    );
+                    // Perform transaction signing
+                    Operations::sign_unsigned_tx(account_key, input, output)?;
+                }
                 _ => (),
             }
         }
     }
 
     Ok(())
+}
+
+fn account_from_private_keys(account_private_keys: AccountPrivateKeys) -> Account {
+    // Decode spend private key
+    let mut spend_bytes = [0u8; 32];
+    hex::decode_to_slice(account_private_keys.spend_private_key, &mut spend_bytes)
+        .map_err(|e| anyhow!("Invalid spend_private_key hex: {}", e));
+    let spend_private_key: RistrettoPrivate = (&spend_bytes)
+        .try_into()
+        .map_err(|_| anyhow!("Invalid spend_private_key bytes - not a valid scalar"))
+        .unwrap();
+
+    // Decode view private key
+    let mut view_bytes = [0u8; 32];
+    hex::decode_to_slice(account_private_keys.view_private_key, &mut view_bytes)
+        .map_err(|e| anyhow!("Invalid view_private_key hex: {}", e));
+    let view_private_key: RistrettoPrivate = (&view_bytes)
+        .try_into()
+        .map_err(|_| anyhow!("Invalid view_private_key bytes - not a valid scalar"))
+        .unwrap();
+
+    let root_view_private = RootViewPrivate::from(view_private_key);
+    let root_spend_private = RootSpendPrivate::from(spend_private_key);
+
+    return Account::new(root_view_private, root_spend_private);
 }

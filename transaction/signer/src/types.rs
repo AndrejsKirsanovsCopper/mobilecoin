@@ -70,7 +70,7 @@ pub struct TxoSyncResp {
     pub account_id: AccountId,
 
     /// public keys and key images for synced TxOuts
-    pub txos: Vec<TxoSynced>,
+    pub synced_txos: Vec<TxoSynced>,
 }
 
 /// Synced TxOut instance, contains public key and resolved key image for owned
@@ -84,6 +84,77 @@ pub struct TxoSynced {
     /// recovered key image for synced TxOut
     #[serde(with = "const_array_hex")]
     pub key_image: KeyImage,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnsignedTxProposalWrapper {
+    pub account_id: String,
+    pub unsigned_tx_proposal: UnsignedTxProposalJson,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnsignedTxProposalJson {
+    pub unsigned_tx_proto_bytes_hex: String,
+    pub unsigned_input_txos: Vec<UnsignedInputTxoJson>,
+    pub payload_txos: Vec<OutputTxoJson>,
+    pub change_txos: Vec<OutputTxoJson>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnsignedInputTxoJson {
+    pub tx_out_proto: String,
+    pub tx_out_public_key: String,
+    pub subaddress_index: String,
+    pub amount: AmountJson,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OutputTxoJson {
+    pub tx_out_proto: String,
+    pub tx_out_public_key: String,
+    pub recipient_public_address_b58: String,
+    pub confirmation_number: String,
+    pub amount: AmountJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AmountJson {
+    pub value: String,
+    pub token_id: String,
+}
+
+// Output structures
+
+#[derive(Debug, Serialize)]
+pub struct SignedTxProposalJson {
+    pub tx_proto: String,
+    pub input_txos: Vec<InputTxoJson>,
+    pub payload_txos: Vec<OutputTxoJson>,
+    pub change_txos: Vec<OutputTxoJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InputTxoJson {
+    pub tx_out_proto: String,
+    pub tx_out_public_key: String,
+    pub subaddress_index: String,
+    pub key_image: String,
+    pub amount: AmountJson,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputJson {
+    pub method: String,
+    pub params: SignedTxProposalResult,
+    pub jsonrpc: String,
+    pub id: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SignedTxProposalResult {
+    pub tx_proposal: SignedTxProposalJson,
 }
 
 /// Transaction signing request, issued by full-service to a signer

@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 subtle = { workspace = true, features = ["i128"] }
 tiny-bip39 = { workspace = true }
 zeroize = { workspace = true }
+rand = { version = "0.8", default-features = false }
 
 # MobileCoin dependencies
 mc-account-keys = { workspace = true }
@@ -36,7 +37,9 @@ mc-core-types = { workspace = true, features = ["serde"] }
 mc-crypto-keys = { workspace = true }
 mc-crypto-ring-signature = { workspace = true }
 mc-crypto-ring-signature-signer = { workspace = true }
+mc-api = { workspace = true }
 mc-transaction-core = { workspace = true }
+mc-transaction-extra = { workspace = true }
 mc-transaction-summary = { workspace = true }
 mc-util-repr-bytes = { workspace = true }
 mc-util-serial = { workspace = true }

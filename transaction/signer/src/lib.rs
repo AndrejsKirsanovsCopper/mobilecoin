@@ -3,24 +3,28 @@
 //! Transaction signer types, this defines the API for communication with
 //! external reansaction signers, such as the offline signer, or other
 //! hardware-backed wallets.
-
-use std::path::Path;
-
+use anyhow::Result;
 use clap::Parser;
-use log::debug;
+use log::{debug, info};
+use mc_account_keys::AccountKey;
+use mc_api::external;
+use mc_crypto_ring_signature::KeyImage;
+use mc_transaction_core::{onetime_keys::recover_onetime_private_key, tx::TxOut, Amount, TokenId};
+use mc_transaction_extra::UnsignedTx;
 use rand_core::{CryptoRng, OsRng, RngCore};
 use serde::{de::DeserializeOwned, Serialize};
+use std::path::Path;
 
 use mc_core::keys::TxOutPublic;
 use mc_crypto_keys::RistrettoPublic;
-use mc_crypto_ring_signature_signer::RingSigner;
+use mc_crypto_ring_signature_signer::{LocalRingSigner, RingSigner};
 use mc_transaction_core::{
     ring_ct::{
         Error as RingCtError, ExtendedMessageDigest, InputRing, SignatureRctBulletproofs,
         SigningData,
     },
     tx::Tx,
-    Amount, TokenId, TxSummary, UnmaskedAmount,
+    TxSummary, UnmaskedAmount,
 };
 use mc_transaction_summary::TxSummaryUnblindingData;
 
@@ -36,20 +40,12 @@ use traits::*;
 pub enum Operations {
     /// Fetch account keys
     GetAccount {
-        /// SLIP-0010 index for account derivation
-        #[clap(long, default_value = "0")]
-        account: u32,
-
         /// Output file to write view account object
         #[clap(long)]
         output: String,
     },
     /// Sync TXOs, recovering key images for each txo
     SyncTxos {
-        /// SLIP-0010 account index for SLIP-010 derivation
-        #[clap(long, default_value = "0")]
-        account: u32,
-
         /// Input file containing unsynced TxOuts
         #[clap(long)]
         input: String,
@@ -60,10 +56,16 @@ pub enum Operations {
     },
     /// Sign offline transaction, returning a signed transaction object
     SignTx {
-        /// SLIP-0010 account index for SLIP-010 derivation
-        #[clap(long, default_value = "0")]
-        account: u32,
+        /// Input file containing transaction for signing
+        #[clap(long)]
+        input: String,
 
+        /// Output file to write signed transaction
+        #[clap(long)]
+        output: String,
+    },
+    /// Sign offline transaction, returning a signed transaction object
+    SignUnsignedTx {
         /// Input file containing transaction for signing
         #[clap(long)]
         input: String,
@@ -77,11 +79,7 @@ pub enum Operations {
 impl Operations {
     /// Fetch account index for a given command
     pub fn account_index(&self) -> u32 {
-        match self {
-            Operations::GetAccount { account, .. } => *account,
-            Operations::SyncTxos { account, .. } => *account,
-            Operations::SignTx { account, .. } => *account,
-        }
+        0
     }
 
     /// Fetch view account credentials
@@ -142,7 +140,7 @@ impl Operations {
 
         let resp = TxoSyncResp {
             account_id: req.account_id,
-            txos: synced,
+            synced_txos: synced,
         };
 
         // Write matched key images
@@ -207,6 +205,114 @@ impl Operations {
         // Write signed transaction output
         debug!("Writing signed transaction to '{}'", output);
         write_output(output, &resp)?;
+
+        Ok(())
+    }
+
+    pub fn sign_unsigned_tx(
+        account_key: AccountKey,
+        input: &str,
+        output: &str,
+    ) -> anyhow::Result<()> {
+        // Load unsigned transaction object
+        info!("Reading unsigned transaction from '{}'", input);
+        // let req: TxSignReq = read_input(input)?;
+        let unsigned_tx_proposal_wrapper: UnsignedTxProposalWrapper = read_input(input)?;
+        let unsigned_proposal = unsigned_tx_proposal_wrapper.unsigned_tx_proposal;
+
+        info!(
+            "Loaded unsigned tx proposal with {} inputs",
+            unsigned_proposal.unsigned_input_txos.len()
+        );
+        // Decode the unsigned tx protobuf
+        let unsigned_tx_bytes = hex::decode(&unsigned_proposal.unsigned_tx_proto_bytes_hex)
+            .map_err(|e| anyhow::anyhow!("Failed to decode unsigned_tx_proto_bytes_hex: {}", e))?;
+
+        let unsigned_tx_proto: external::UnsignedTx = mc_util_serial::decode(&unsigned_tx_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to decode UnsignedTx protobuf: {}", e))?;
+
+        let unsigned_tx: UnsignedTx = (&unsigned_tx_proto)
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to convert UnsignedTx: {:?}", e))?;
+
+        println!("Decoded unsigned transaction");
+
+        // Process input TXOs and compute key images
+        let mut input_txos = Vec::new();
+        for input in &unsigned_proposal.unsigned_input_txos {
+            let tx_out_bytes = hex::decode(&input.tx_out_proto)
+                .map_err(|e| anyhow::anyhow!("Failed to decode tx_out_proto: {}", e))?;
+            let tx_out: TxOut = mc_util_serial::decode(&tx_out_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to decode TxOut protobuf: {}", e))?;
+
+            let subaddress_index: u64 = input
+                .subaddress_index
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid subaddress_index: {}", e))?;
+
+            // Compute key image
+            let tx_out_public_key =
+                mc_crypto_keys::RistrettoPublic::try_from(&tx_out.public_key)
+                    .map_err(|e| anyhow::anyhow!("Invalid tx_out public key: {:?}", e))?;
+
+            let onetime_private_key = recover_onetime_private_key(
+                &tx_out_public_key,
+                account_key.view_private_key(),
+                &account_key.subaddress_spend_private(subaddress_index),
+            );
+
+            let key_image = KeyImage::from(&onetime_private_key);
+
+            input_txos.push(InputTxoJson {
+                tx_out_proto: input.tx_out_proto.clone(),
+                tx_out_public_key: input.tx_out_public_key.clone(),
+                subaddress_index: input.subaddress_index.clone(),
+                key_image: hex::encode(key_image.as_ref() as &[u8]),
+                amount: input.amount.clone(),
+            });
+        }
+
+        info!("Computed {} key images", input_txos.len());
+
+        // Sign the transaction
+        let signer = LocalRingSigner::from(&account_key);
+        let mut rng = rand::thread_rng();
+        let signed_tx = unsigned_tx
+            .sign(&signer, None, &mut rng)
+            .map_err(|e| anyhow::anyhow!("Failed to sign transaction: {:?}", e))?;
+
+        println!("Transaction signed successfully!");
+
+        // Encode signed transaction
+        let tx_bytes = mc_util_serial::encode(&signed_tx);
+        let tx_proto_hex = hex::encode(&tx_bytes);
+
+        // Build output
+        let signed_proposal = SignedTxProposalJson {
+            tx_proto: tx_proto_hex,
+            input_txos,
+            payload_txos: unsigned_proposal.payload_txos.clone(),
+            change_txos: unsigned_proposal.change_txos.clone(),
+        };
+
+        let output_json = OutputJson {
+            method: "sign_tx".to_string(),
+            params: SignedTxProposalResult {
+                tx_proposal: signed_proposal,
+            },
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+        };
+
+        // Write output
+        let output_json_string = serde_json::to_string_pretty(&output_json)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize output: {}", e))?;
+
+        write_output(output, &output_json)?;
+        // fs::write(&args.output, &output_json)
+        //     .map_err(|e| anyhow!("Failed to write output file: {}", e))?;
+
+        info!("Signed transaction written to: {}", output);
 
         Ok(())
     }
